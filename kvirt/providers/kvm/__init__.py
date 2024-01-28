@@ -854,10 +854,13 @@ class Kvirt(object):
             displayxml = """<input type='mouse' bus='ps2'/>"""
         vncviewerpath = '/Applications/VNC Viewer.app'
         passwd = "passwd='kcli'" if os.path.exists('/Applications') and not os.path.exists(vncviewerpath) else ''
-        displayxml += """<graphics type='%s' port='-1' autoport='yes' listen='%s' %s>
+        display = "" # try without graphics
+        if display:
+            displayxml += """<graphics type='%s' port='-1' autoport='yes' listen='%s' %s>
 <listen type='address' address='%s'/>
 </graphics>
-<memballoon model='virtio'/>""" % (display, listen, passwd, listen)
+""" % (display, listen, passwd, listen)
+        displayxml += """ <memballoon model='virtio'/>"""
         if aarch64_full:
             displayxml += """<video><model type='virtio' vram='16384' heads='1' primary='yes'/></video>"""
         if cpumodel == 'host-model' and not aarch64:
