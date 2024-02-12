@@ -551,6 +551,24 @@ $ kcli info baremetal-host -P user=admin -P password=admin 10.10.10.10
 $ kcli info baremetal-host -u admin -p admin 10.10.10.10
 """
 
+updatehosts = """# Update bare metal hosts declared in a parameter file
+
+$ kcli update baremetal-hosts --pf baremetal_hosts.yml -P secureboot=true
+
+baremetal_hosts.yml contains
+bmc_user: admin
+bmc_password: admin
+baremetal_hosts:
+- bmc_url: http://192.168.122.1:9000/redfish/v1/Systems/local/vm1
+- bmc_url: http://192.168.122.1:9000/redfish/v1/Systems/local/vm2
+
+# Update a single host
+$ kcli update baremetal-host -P user=admin -P password=admin 10.10.10.10 -P secureboot=true
+
+# Update a single host with dedicated flags for credentials
+$ kcli update baremetal-host -u admin -p admin 10.10.10.10 -P secureboot=true
+"""
+
 ocdownload = """# Download 4.13 stable
 $ kcli download oc -P version=stable -P tag=4.13
 
@@ -692,6 +710,10 @@ $ kcli create subnet -c 10.0.1.0/24 -P network=mynetwork -P gateway=false mysubn
 
 # Create a subnet on GCP with an alias/dual network with specific name
 $ kcli create subnet -P cidr=192.168.123.0/24 -P dual_cidr=192.168.124.0/24 -P dual_name=podnetwork mysubnet
+"""
+
+subnetupdate = """# Add a route in subnet mysubnet to specific cidr using an intermediate vm (aws specific)
+$ kcli update subnet mysubnet -P routes=['{"cidr": "192.168.125.0/24", "vm": "myvm"}']
 """
 
 vmupdate = """# Update memory and cpu of a vm

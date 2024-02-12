@@ -9,7 +9,8 @@ from kvirt.common import error, pprint, success, warning, info2, fix_typos
 from kvirt.common import get_oc, pwd_path, get_oc_mirror
 from kvirt.common import get_latest_fcos, generate_rhcos_iso, olm_app, get_commit_rhcos
 from kvirt.common import get_installer_rhcos, wait_cloud_dns, delete_lastvm
-from kvirt.common import ssh, scp, _ssh_credentials, get_ssh_pub_key, start_baremetal_hosts, separate_yamls
+from kvirt.common import ssh, scp, _ssh_credentials, get_ssh_pub_key, separate_yamls
+from kvirt.common import start_baremetal_hosts, update_baremetal_hosts
 from kvirt.defaults import LOCAL_OPENSHIFT_APPS, OPENSHIFT_TAG
 import os
 import re
@@ -164,7 +165,7 @@ def update_disconnected_registry(config, plandir, cluster, data):
     extra_images = data.get('disconnected_extra_images', [])
     kcli_images = ['curl', 'haproxy', 'kubectl', 'mdns-publisher', 'origin-coredns',
                    'origin-keepalived-ipfailover']
-    kcli_images = [f'quay.io/karmab/{image}:latest' for image in kcli_images]
+    kcli_images = [f'quay.io/karmab/{image}:multi' for image in kcli_images]
     extra_images.extend(kcli_images)
     mirror_data['extra_images'] = [*set(extra_images)]
     mirrorconf = config.process_inputfile(cluster, f"{plandir}/disconnected/scripts/mirror-config.yaml.sample",
@@ -343,7 +344,8 @@ def get_downstream_installer(version='stable', macosx=False, tag=None, debug=Fal
         if debug:
             pprint(cmd)
         return call(cmd, shell=True)
-    arch = 'arm64' if os.uname().machine == 'aarch64' else None
+    arch_map = {'aarch64': 'arm64', 's390x': 's390x'}
+    arch = arch_map.get(os.uname().machine)
     repo = 'ocp-dev-preview' if version == 'dev-preview' else 'ocp'
     if tag is None:
         repo += '/{version}'
@@ -369,7 +371,7 @@ def get_downstream_installer(version='stable', macosx=False, tag=None, debug=Fal
     if version is None:
         error("Couldn't find version")
         return 1
-    if arch == 'arm64':
+    if arch is not None:
         cmd = f"curl -Ls https://mirror.openshift.com/pub/openshift-v4/{arch}/clients/{repo}/"
     else:
         cmd = f"curl -Ls https://mirror.openshift.com/pub/openshift-v4/clients/{repo}/"
@@ -669,6 +671,10 @@ def scale(config, plandir, cluster, overrides):
             svcport_cmd = 'oc get svc -n default httpd-kcli-svc -o yaml'
             svcport = safe_load(os.popen(svcport_cmd).read())['spec']['ports'][0]['nodePort']
             iso_url = f'http://{svcip}:{svcport}/{cluster}-worker.iso'
+        if 'secureboot' in overrides or [h for h in baremetal_hosts if 'secureboot' in h or 'bmc_secureboot' in h]:
+            result = update_baremetal_hosts(baremetal_hosts, overrides=overrides, debug=config.debug)
+            if result['result'] != 'success':
+                return result
         result = start_baremetal_hosts(baremetal_hosts, iso_url, overrides=overrides, debug=config.debug)
         if result['result'] != 'success':
             return result
@@ -724,6 +730,7 @@ def create(config, plandir, cluster, overrides, dnsconfig=None):
             'worker_localhost_fix': False,
             'sno': False,
             'sno_disk': None,
+            'sno_debug': False,
             'sno_ctlplanes': False,
             'sno_workers': False,
             'sno_wait': False,
@@ -770,6 +777,12 @@ def create(config, plandir, cluster, overrides, dnsconfig=None):
             'retries': 2}
     data.update(overrides)
     fix_typos(data)
+    ctlplanes = data['ctlplanes']
+    if ctlplanes <= 0:
+        return {'result': 'failure', 'reason': f"Invalid number of ctlplanes {ctlplanes}"}
+    workers = data['workers']
+    if workers < 0:
+        return {'result': 'failure', 'reason': f"Invalid number of workers {workers}"}
     if data.get('dual_api_ip') is not None:
         warning("Forcing dualstack")
         data['dualstack'] = True
@@ -805,11 +818,12 @@ def create(config, plandir, cluster, overrides, dnsconfig=None):
     overrides['kube'] = data['cluster']
     installparam = overrides.copy()
     installparam['cluster'] = clustervalue
-    baremetal_ctlplane = data['workers'] == 0 and baremetal_hosts and len(baremetal_hosts) > 1
+    baremetal_sno = workers == 0 and len(baremetal_hosts) == 1
+    baremetal_ctlplane = data['workers'] == 0 and len(baremetal_hosts) > 1
     sno_vm = data['sno_vm']
-    sno = sno_vm or data['sno'] or baremetal_ctlplane
+    sno = sno_vm or data['sno'] or baremetal_ctlplane or baremetal_sno
     data['sno'] = sno
-    sno_wait = data.get('api_ip') is not None or sno_vm or data['sno_wait']
+    sno_wait = overrides.get('sno_wait') or baremetal_sno or data.get('api_ip') is not None or sno_vm
     sno_disk = data['sno_disk']
     sno_ctlplanes = data['sno_ctlplanes'] or baremetal_ctlplane
     sno_workers = data['sno_workers']
@@ -825,10 +839,6 @@ def create(config, plandir, cluster, overrides, dnsconfig=None):
         if data.get('network_type', 'OVNKubernetes') == 'OpenShiftSDN':
             warning("Forcing network_type to OVNKubernetes")
             data['network_type'] = 'OVNKubernetes'
-    ctlplanes = data.get('ctlplanes', 1)
-    if ctlplanes <= 0:
-        msg = "Invalid number of ctlplanes"
-        return {'result': 'failure', 'reason': msg}
     network = data.get('network')
     post_dualstack = False
     if data['dualstack'] and provider in cloud_providers:
@@ -1344,7 +1354,7 @@ def create(config, plandir, cluster, overrides, dnsconfig=None):
             ingressrole = 'master' if workers == 0 or not mdns or kubevirt_api_service else 'worker'
             replicas = 1 if sno or len(baremetal_hosts) == 1 else 2
             bm_workers = len(baremetal_hosts) > 0 and workers > 0
-            if provider in virt_providers and ((sslip and ingress_ip is None) or worker_localhost_fix or bm_workers):
+            if provider in virt_providers and (worker_localhost_fix or bm_workers):
                 replicas = ctlplanes
                 ingressrole = 'master'
                 warning("Forcing router pods on ctlplanes")
@@ -1584,6 +1594,10 @@ def create(config, plandir, cluster, overrides, dnsconfig=None):
             iso_url = handle_baremetal_iso_sno(config, plandir, cluster, data, baremetal_hosts, iso_pool)
             if len(baremetal_hosts) > 0:
                 overrides['role'] = 'ctlplane' if sno_ctlplanes else 'worker'
+            if 'secureboot' in overrides or [h for h in baremetal_hosts if 'secureboot' in h or 'bmc_secureboot' in h]:
+                result = update_baremetal_hosts(baremetal_hosts, overrides=overrides, debug=config.debug)
+                if result['result'] != 'success':
+                    return result
             result = start_baremetal_hosts(baremetal_hosts, iso_url, overrides=overrides, debug=config.debug)
             if result['result'] != 'success':
                 return result

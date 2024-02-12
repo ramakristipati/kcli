@@ -124,6 +124,7 @@ class Kaws(object):
                 Filters = [{'Name': _filter, 'Values': [image]}]
             images = conn.describe_images(Filters=Filters)
             if 'Images' in images and images['Images']:
+                minimal_disksize = images['Images'][0]['BlockDeviceMappings'][0]['Ebs']['VolumeSize']
                 imageinfo = images['Images'][0]
                 imageid = imageinfo['ImageId']
                 if _filter == 'name':
@@ -339,6 +340,8 @@ class Kaws(object):
                 disksize = int(disk)
             elif isinstance(disk, dict):
                 disksize = int(disk.get('size', 10))
+                if index == 0 and disksize < minimal_disksize:
+                    disksize = minimal_disksize
                 blockdevicemapping['Ebs']['VolumeType'] = disk.get('type', 'standard')
             blockdevicemapping['Ebs']['VolumeSize'] = disksize
             blockdevicemappings.append(blockdevicemapping)
@@ -400,12 +403,10 @@ class Kaws(object):
                     'KeyName': keypair, 'BlockDeviceMappings': blockdevicemappings,
                     'NetworkInterfaces': networkinterfaces, 'UserData': userdata,
                     'TagSpecifications': vmtags}
-            sourcedestcheck = overrides.get('SourceDestCheck', False) or overrides.get('router', False)
-            if sourcedestcheck:
-                data['SourceDestCheck'] = True
             if az is not None:
                 data['Placement'] = {'AvailabilityZone': az}
             response = conn.run_instances(**data)
+            instance_id = response['Instances'][0]['InstanceId']
         if reservedns and domain is not None:
             self.reserve_dns(name, nets=nets, domain=domain, alias=alias, instanceid=name)
         if 'kubetype' in metadata and metadata['kubetype'] == "openshift":
@@ -418,7 +419,6 @@ class Kaws(object):
                 self.create_instance_profile(cluster, iam_role)
                 sleep(15)
             arn = self.get_instance_profile(cluster)['Arn']
-            instance_id = response['Instances'][0]['InstanceId']
             while True:
                 current_status = self.status(name)
                 if current_status == 'running':
@@ -427,6 +427,9 @@ class Kaws(object):
                 sleep(5)
             conn.associate_iam_instance_profile(IamInstanceProfile={'Name': cluster, 'Arn': arn},
                                                 InstanceId=instance_id)
+        if overrides.get('SourceDestCheck', False) or overrides.get('router', False):
+            conn.modify_instance_attribute(InstanceId=instance_id, Attribute='sourceDestCheck', Value='false',
+                                           DryRun=False)
         return {'result': 'success'}
 
     def start(self, name):
@@ -630,7 +633,7 @@ class Kaws(object):
         state = vm['State']['Name']
         amid = vm['ImageId']
         az = vm['Placement']['AvailabilityZone']
-        yamlinfo['vpcid'] = vm['VpcId']
+        yamlinfo['vpcid'] = vm.get('VpcId', 'N/A')
         image = resource.Image(amid)
         source = os.path.basename(image.image_location)
         yamlinfo['plan'] = ''
@@ -762,6 +765,9 @@ class Kaws(object):
             vm = conn.describe_instances(**df)['Reservations'][0]['Instances'][0]
         except:
             return {'result': 'failure', 'reason': f"VM {name} not found"}
+        if vm['State']['Name'] == 'terminated':
+            warning(f"VM {name} already deleted")
+            return {'result': 'success', 'reason': f"VM {name} already deleted"}
         instance_id = vm['InstanceId']
         kubetype = None
         if 'Tags' in vm:
@@ -1226,6 +1232,9 @@ class Kaws(object):
         results = {}
         private_subnets = []
         for route_table in conn.describe_route_tables()['RouteTables']:
+            if [route for route in route_table['Routes'] if route.get('GatewayId') is not None and
+                    route.get('GatewayId').startswith('igw')]:
+                continue
             for association in (route_table['Associations']):
                 if 'SubnetId' in association:
                     private_subnets.append(association['SubnetId'])
@@ -1989,6 +1998,62 @@ class Kaws(object):
         if matching_subnets:
             self.conn.create_tags(Resources=matching_subnets, Tags=Tags)
 
+    def update_subnet(self, name, overrides={}):
+        conn = self.conn
+        subnets = conn.describe_subnets()
+        matching = [subnet for subnet in subnets['Subnets'] if subnet['SubnetId'] == name or tag_name(subnet) == name]
+        if not matching:
+            return {'result': 'failure', 'reason': f"Subnet {name} not found"}
+        subnet_vpc_id = matching[0]['VpcId']
+        subnet_id = matching[0]['SubnetId']
+        response = conn.describe_route_tables(Filters=[{'Name': 'association.subnet-id', 'Values': [subnet_id]}])
+        if not response.get('RouteTables', []):
+            return {'result': 'failure', 'reason': "Updating a subnet without route table is not supported"}
+        route_table_id = response['RouteTables'][0]['RouteTableId']
+        response = conn.describe_route_tables(RouteTableIds=[route_table_id])
+        routes = response['RouteTables'][0]['Routes']
+        existing_cidrs = [d.get('DestinationCidrBlock') or d.get('DestinationIpv6CidrBlock') for d in routes]
+        if 'cidr' in overrides and 'vm' in overrides:
+            overrides['routes'] = {"cidr": overrides['cidr'], "vm": overrides['vm']}
+        for route in overrides.get('routes', []):
+            cidr = route.get('cidr')
+            vm = route.get('vm')
+            if vm is not None and cidr is not None:
+                if cidr in existing_cidrs:
+                    warning(f"cidr {cidr} already in route table")
+                    continue
+                try:
+                    ip_network(cidr, strict=False)
+                except:
+                    return {'result': 'failure', 'reason': f"Invalid Cidr {cidr}"}
+                df = {'InstanceIds': [vm]} if vm.startswith('i-') else {'Filters': [{'Name': "tag:Name",
+                                                                                     'Values': [vm]}]}
+                try:
+                    vm_data = conn.describe_instances(**df)['Reservations'][0]['Instances'][0]
+                except:
+                    return {'result': 'failure', 'reason': f"Vm {vm} not found"}
+                interface = vm_data['NetworkInterfaces'][0]
+                vm_vpc_id = interface['VpcId']
+                if vm_vpc_id != subnet_vpc_id:
+                    return {'result': 'failure', 'reason': f"Vm {vm} primary nic doesnt belong to same vpc"}
+                nic_id = interface['NetworkInterfaceId']
+                block = 'DestinationIpv6CidrBlock' if ':' in cidr else 'DestinationCidrBlock'
+                data = {block: cidr, 'RouteTableId': route_table_id, 'NetworkInterfaceId': nic_id}
+                conn.create_route(**data)
+        return {'result': 'success'}
+
     def list_dns_zones(self):
         dns = self.dns
         return [z['Name'] for z in dns.list_hosted_zones_by_name()['HostedZones']]
+
+    def set_router_mode(self, name, mode=True):
+        conn = self.conn
+        df = {'InstanceIds': [name]} if name.startswith('i-') else {'Filters': [{'Name': "tag:Name", 'Values': [name]}]}
+        try:
+            vm = conn.describe_instances(**df)['Reservations'][0]['Instances'][0]
+        except:
+            error(f"VM {name} not found")
+            return {}
+        instance_id = vm['InstanceId']
+        mode = 'false' if mode else 'true'
+        conn.modify_instance_attribute(InstanceId=instance_id, Attribute='sourceDestCheck', Value=mode, DryRun=False)
